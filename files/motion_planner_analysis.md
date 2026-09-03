@@ -255,7 +255,192 @@ go_velocity = trackVelocity;
 
 ---
 
-## 3. 设计要点小结
+## 3. TrajectoryTracker 详解（轨迹模式在线插值与超时保护）
+
+`TrajectoryTracker` 服务于 `MODE_COMMAND_Trajectory`（轨迹模式）。与 `PositionTracker`
+「固件自己规划梯形曲线」不同，轨迹模式把**整条轨迹的规划权交给上位机**：上位机做完运动学
+逆解后，周期性下发一串 **(目标位置, 目标速度)** 设定点对，固件只负责在相邻两个设定点之间做
+**20kHz 恒定加速度插值**，并在通信中断时兜底减速停车。
+
+每拍（20kHz）由 `motor.cpp` 调用（L189-190、L229-233）：
+
+```cpp
+// ① 模式切入时：用真实估计状态无扰动续接
+case MODE_COMMAND_Trajectory:
+    motionPlanner.trajectoryTracker.NewTask(controller->estPosition, controller->estVelocity);
+// ② 每拍更新软目标
+case MODE_COMMAND_Trajectory:
+    motionPlanner.trajectoryTracker.CalcSoftGoal(controller->goalPosition, controller->goalVelocity);
+    controller->softPosition = motionPlanner.trajectoryTracker.goPosition;
+    controller->softVelocity = motionPlanner.trajectoryTracker.goVelocity;
+```
+
+输出的 `goPosition / goVelocity` 即喂给 DCE 双闭环的 `softPosition / softVelocity`
+（motor.cpp L120-122 `CalcDceToOutput(softPosition, softVelocity)`）。
+
+### 3.1 内部状态与参数
+
+```cpp
+// 输出
+int32_t goPosition;   // 本拍软目标位置
+int32_t goVelocity;   // 本拍软目标速度
+
+// 规划状态（插值器自己积分出的理想轨迹）
+int32_t positionNow;              // 当前规划位置
+int32_t velocityNow;              // 当前规划速度
+int32_t dynamicVelocityAcc;       // 本段恒定加速度（收到新点时反解一次，段内保持）
+int32_t dynamicVelocityAccRemainder; // 速度定点积分余数
+int32_t velovityNowRemainder;     // 位置定点积分余数（源码拼写如此）
+
+// 新点检测与超时保护
+int32_t recordPosition;      // 上一次收到的目标位置
+int32_t recordVelocity;      // 上一次收到的目标速度
+int32_t updateTime;          // 距上次收到新点的累计时间（µs）
+int32_t updateTimeout = 200; // 设定点最大允许间隔（ms），由 Init(200) 设定
+bool    overtimeFlag;        // 超时标志
+int32_t velocityDownAcc;     // 超时减速用减速度 = ratedVelocityAcc
+```
+
+- `NewTask(real_location, real_speed)`：模式切入/新任务时把 `positionNow/velocityNow` 对齐到
+  真实估计值，清零两个积分余数、`updateTime` 与 `overtimeFlag`，实现**无扰动续接**；
+- `Init()`：`velocityDownAcc = ratedVelocityAcc`，`updateTimeout = 200ms`。
+
+### 3.2 核心：两点边值反解恒定加速度
+
+`CalcSoftGoal` 第一步判断「本拍是否收到了新设定点」——用 `recordPosition/recordVelocity`
+与入参比较（motion_planner.cpp L400-410）：
+
+```cpp
+if (_goalVelocity != recordVelocity || _goalPosition != recordPosition) {
+    updateTime = 0;
+    recordVelocity = _goalVelocity;
+    recordPosition = _goalPosition;
+    dynamicVelocityAcc = (int32_t)((float)(_goalVelocity + velocityNow) *
+                                   (float)(_goalVelocity - velocityNow) /
+                                   (float)(2 * (_goalPosition - positionNow)));
+    overtimeFlag = false;
+}
+```
+
+关键就是这行加速度的求解。利用**不含时间的运动学公式** `v² = v₀² + 2a·Δs`，反解 a：
+
+```text
+              v_goal² − v_now²     (v_goal + v_now)·(v_goal − v_now)
+    a  =  ─────────────────────  =  ─────────────────────────────────
+              2·(p_goal − p_now)          2·(p_goal − p_now)
+```
+
+- 分子 `(_goalVelocity + velocityNow)·(_goalVelocity − velocityNow)` = `v_goal² − v_now²`
+  （用平方差展开而非直接平方，且以 float 承载，避免 int32 溢出）；
+- 分母 `2·(_goalPosition − positionNow)` = `2·Δs`；
+- 解出的 `a` 保证：**从当前规划状态 (positionNow, velocityNow) 出发，以恒定加速度运动，
+  恰好在到达 p_goal 时速度等于 v_goal**——精确匹配上位机给定的位置与速度两个边界条件。
+
+这个 `dynamicVelocityAcc` **每收到一个新点才重算一次**，段内保持不变；下一拍即使没有新点，
+也继续沿用它积分，直到走到该段末端或收到下一个点。
+
+### 3.3 无新点时：计时 + 超时兜底
+
+```cpp
+} else {
+    if (updateTime >= (updateTimeout * 1000))   // 200ms → 200000µs
+        overtimeFlag = true;
+    else
+        updateTime += context->CONTROL_PERIOD;  // 每拍 +50µs
+}
+```
+
+- 只要设定点没变化，就累加 `updateTime`（每拍 50µs，200ms 对应 4000 拍）；
+- 一旦超过 `updateTimeout`（默认 200ms）仍无新点，判定上位机掉线/停发 → 置 `overtimeFlag`，
+  转入安全减速。
+
+### 3.4 逐拍积分：生成 goPosition / goVelocity
+
+```cpp
+if (overtimeFlag) {                     // 超时：减速到 0（安全兜底）
+    if (velocityNow == 0)       dynamicVelocityAccRemainder = 0;
+    else if (velocityNow > 0) { CalcVelocityIntegral(-velocityDownAcc);
+                                if (velocityNow <= 0){ 余数=0; velocityNow=0; } }
+    else                      { CalcVelocityIntegral(+velocityDownAcc);
+                                if (velocityNow >= 0){ 余数=0; velocityNow=0; } }
+} else {                                // 正常：按反解出的恒定加速度推进
+    CalcVelocityIntegral(dynamicVelocityAcc);
+}
+CalcPositionIntegral(velocityNow);      // 用本拍速度推进位置
+
+goPosition = positionNow;
+goVelocity = velocityNow;
+```
+
+两个定点积分器与 `PositionTracker` 完全同构（显式欧拉 + 余数累加，纯整数、20kHz）：
+
+```cpp
+void CalcVelocityIntegral(int32_t a){   // v += a/20000，余数保留
+    dynamicVelocityAccRemainder += a;
+    velocityNow += dynamicVelocityAccRemainder / CONTROL_FREQUENCY;
+    dynamicVelocityAccRemainder %= CONTROL_FREQUENCY;
+}
+void CalcPositionIntegral(int32_t v){   // p += v/20000，余数保留
+    velovityNowRemainder += v;
+    positionNow += velovityNowRemainder / CONTROL_FREQUENCY;
+    velovityNowRemainder %= CONTROL_FREQUENCY;
+}
+```
+
+- **正常段**：速度按恒定 `dynamicVelocityAcc` 线性变化，位置随之呈抛物线——相邻两设定点间
+  是一段**恒加速度轨迹**（速度线性、位置二次）；
+- **超时段**：忽略 `dynamicVelocityAcc`，改用 `velocityDownAcc`（= ratedVelocityAcc）按速度
+  符号对称地把速度拉回 0，过零即钳位并清余数，最终停稳；
+- 每拍最后**无条件**执行 `CalcPositionIntegral(velocityNow)` 推进位置，并把
+  `positionNow / velocityNow` 赋给 `goPosition / goVelocity`。
+
+### 3.5 决策流程
+
+```mermaid
+flowchart TD
+    A[每拍入口 CalcSoftGoal goalPos, goalVel] --> B{设定点变化?<br/>goal != record}
+    B -- 是/收到新点 --> C[updateTime=0<br/>记录新点<br/>反解 a=v²-v₀²/2Δs<br/>overtimeFlag=false]
+    B -- 否/无新点 --> D{updateTime >= 200ms?}
+    D -- 是 --> E[overtimeFlag=true]
+    D -- 否 --> F[updateTime += 50µs]
+    C --> G{overtimeFlag?}
+    E --> G
+    F --> G
+    G -- 否 --> H[CalcVelocityIntegral dynamicVelocityAcc<br/>恒加速度推进速度]
+    G -- 是 --> I[按 velocityNow 符号<br/>CalcVelocityIntegral ∓velocityDownAcc<br/>过零钳位到 0]
+    H --> J[CalcPositionIntegral velocityNow<br/>推进位置]
+    I --> J
+    J --> K[goPosition=positionNow<br/>goVelocity=velocityNow]
+```
+
+### 3.6 与 PositionTracker 的本质区别
+
+| 维度 | PositionTracker（位置模式） | TrajectoryTracker（轨迹模式） |
+|---|---|---|
+| 输入 | 仅目标位置 `goalPosition` | 目标位置 + 目标速度 `(goalPosition, goalVelocity)` |
+| 曲线由谁规划 | **固件**：每拍用刹车距离 `\|Δp\|≤v²/2a` 反应式决策加/减速 | **上位机**：固件只在相邻设定点间做恒加速度插值 |
+| 加速度来源 | 固定 ±ratedVelocityAcc，靠判据切换加/减速段 | 每个新点用 `a=(v²−v₀²)/2Δs` 反解，段内恒定 |
+| 速度封顶 | 有（ratedVelocity） | 无，速度轮廓完全由上位机 (p,v) 对决定 |
+| 停车方式 | 到点自动减速锁定（Δp=0 且 v≈0） | 靠上位机把 v_goal 收敛到 0；掉线时超时减速兜底 |
+| 适用场景 | 单轴点到点定位，断总线也能走完停稳 | 多轴机械臂连续轨迹，末端路径由上位机逆解统一保证 |
+
+一句话概括：**PositionTracker 是「给我终点，我自己规划怎么平稳走到并停下」；
+TrajectoryTracker 是「你（上位机）已经把轨迹算好并逐点告诉我该到哪、该多快，我只负责把稀疏
+设定点插值成 20kHz 连续软目标，并在你断线时安全刹车」。**
+
+### 3.7 使用注意（潜在边界）
+
+1. **Δp=0 的奇点**：若某新点的 `_goalPosition == positionNow`，反解式分母为 0，
+   `dynamicVelocityAcc` 会得到 inf / 异常大的整数。上位机应避免下发「位置不变但速度突变」
+   的设定点，或保证相邻点位置严格递进。
+2. **updateTimeout 需匹配下发频率**：默认 200ms。上位机若下发间隔可能超过它会误触发减速；
+   高频流式下发（如 ≥50Hz，即 20ms 一个点）时 200ms 有足够裕度。
+3. **无内部限速/限位**：轨迹模式不校验 ratedVelocity 与软限位，运动安全性依赖上位机规划的
+   正确性 + 固件超时兜底这道最后防线。
+
+---
+
+## 4. 设计要点小结
 
 1. **反应式而非预规划**：不预先生成整条曲线，每拍独立决策，天然支持运动中改目标、改限速
    （`ratedVelocity` 被 CAN 指令实时修改也立即生效）。
