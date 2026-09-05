@@ -73,7 +73,7 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             motor.controller->SetPositionSetPointWithTime(
                 (int32_t) (*(float*) RxData * (float) motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS),
                 *(float*) (RxData + 4));
-            if (_data[4]) // Need Position & Finished ACK
+            // if (_data[4]) // Need Position & Finished ACK
             {
                 tmpF = motor.controller->GetPosition();
                 auto* b = (unsigned char*) &tmpF;
@@ -104,6 +104,16 @@ void OnCanCmd(uint8_t _cmd, uint8_t* _data, uint32_t _len)
             txHeader.StdId = (boardConfig.canNodeId << 7) | 0x23;
             CAN_Send(&txHeader, _data);
         }
+            break;
+        case 0x08:  // Set Trajectory SetPoint (position + velocity feed-forward)
+            if (motor.controller->modeRunning != Motor::MODE_COMMAND_Trajectory)
+            {
+                motor.config.motionParams.ratedVelocity = boardConfig.velocityLimit;
+                motor.controller->SetCtrlMode(Motor::MODE_COMMAND_Trajectory);
+            }
+            motor.controller->AddTrajectorySetPoint(
+                (int32_t) (*(float*) RxData * (float) motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS),
+                (int32_t) (*(float*) (RxData + 4) * (float) motor.MOTOR_ONE_CIRCLE_SUBDIVIDE_STEPS));
             break;
 
             // 0x10~0x1F CMDs with Memory

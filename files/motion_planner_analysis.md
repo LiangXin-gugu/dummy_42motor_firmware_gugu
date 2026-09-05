@@ -391,26 +391,31 @@ void CalcPositionIntegral(int32_t v){   // p += v/20000，余数保留
   是一段**恒加速度轨迹**（速度线性、位置二次）；
 - **超时段**：忽略 `dynamicVelocityAcc`，改用 `velocityDownAcc`（= ratedVelocityAcc）按速度
   符号对称地把速度拉回 0，过零即钳位并清余数，最终停稳；
-- 每拍最后**无条件**执行 `CalcPositionIntegral(velocityNow)` 推进位置，并把
-  `positionNow / velocityNow` 赋给 `goPosition / goVelocity`。
+- 正常段每拍执行 `CalcPositionIntegral(velocityNow)` 推进位置，并把 `positionNow / velocityNow`
+  赋给 `goPosition / goVelocity`；零速目标下若本拍位置越过 goalPosition，则改为锁存对齐到该点（见 §3.7）。
 
 ### 3.5 决策流程
 
 ```mermaid
 flowchart TD
     A[每拍入口 CalcSoftGoal goalPos, goalVel] --> B{设定点变化?<br/>goal != record}
-    B -- 是/收到新点 --> C[updateTime=0<br/>记录新点<br/>反解 a=v²-v₀²/2Δs<br/>overtimeFlag=false]
+    B -- 是/收到新点 --> C[updateTime=0 记录新点 holdFlag=false<br/>反解 a=v²-v₀²/2Δs<br/>Δp=0 保护 + 钳到 ±maxAcc<br/>overtimeFlag=false]
     B -- 否/无新点 --> D{updateTime >= 200ms?}
     D -- 是 --> E[overtimeFlag=true]
     D -- 否 --> F[updateTime += 50µs]
-    C --> G{overtimeFlag?}
-    E --> G
-    F --> G
+    C --> HO{holdFlag?}
+    E --> HO
+    F --> HO
+    HO -- 是/已锁存 --> HK[goPosition=p goVelocity=0<br/>return 精确保持]
+    HO -- 否 --> G{overtimeFlag?}
     G -- 否 --> H[CalcVelocityIntegral dynamicVelocityAcc<br/>恒加速度推进速度]
     G -- 是 --> I[按 velocityNow 符号<br/>CalcVelocityIntegral ∓velocityDownAcc<br/>过零钳位到 0]
-    H --> J[CalcPositionIntegral velocityNow<br/>推进位置]
-    I --> J
-    J --> K[goPosition=positionNow<br/>goVelocity=velocityNow]
+    H --> J{零速目标 且 本拍位置越过 p?}
+    J -- 是 --> L[锁存 positionNow=p<br/>velocityNow=0 holdFlag=true]
+    J -- 否 --> M[CalcPositionIntegral velocityNow<br/>推进位置]
+    I --> M
+    L --> K[goPosition=positionNow<br/>goVelocity=velocityNow]
+    M --> K
 ```
 
 ### 3.6 与 PositionTracker 的本质区别
@@ -419,9 +424,9 @@ flowchart TD
 |---|---|---|
 | 输入 | 仅目标位置 `goalPosition` | 目标位置 + 目标速度 `(goalPosition, goalVelocity)` |
 | 曲线由谁规划 | **固件**：每拍用刹车距离 `\|Δp\|≤v²/2a` 反应式决策加/减速 | **上位机**：固件只在相邻设定点间做恒加速度插值 |
-| 加速度来源 | 固定 ±ratedVelocityAcc，靠判据切换加/减速段 | 每个新点用 `a=(v²−v₀²)/2Δs` 反解，段内恒定 |
+| 加速度来源 | 固定 ±ratedVelocityAcc，靠判据切换加/减速段 | 每个新点用 `a=(v²−v₀²)/2Δs` 反解（带 Δp=0 保护、钳到 ±ratedVelocityAcc），段内恒定 |
 | 速度封顶 | 有（ratedVelocity） | 无，速度轮廓完全由上位机 (p,v) 对决定 |
-| 停车方式 | 到点自动减速锁定（Δp=0 且 v≈0） | 靠上位机把 v_goal 收敛到 0；掉线时超时减速兜底 |
+| 停车方式 | 到点自动减速锁定（Δp=0 且 v≈0） | `v_goal=0` 时固件「位置越过」锁存精确停在 p；掉线时超时减速兜底 |
 | 适用场景 | 单轴点到点定位，断总线也能走完停稳 | 多轴机械臂连续轨迹，末端路径由上位机逆解统一保证 |
 
 一句话概括：**PositionTracker 是「给我终点，我自己规划怎么平稳走到并停下」；
@@ -430,13 +435,23 @@ TrajectoryTracker 是「你（上位机）已经把轨迹算好并逐点告诉�
 
 ### 3.7 使用注意（潜在边界）
 
-1. **Δp=0 的奇点**：若某新点的 `_goalPosition == positionNow`，反解式分母为 0，
-   `dynamicVelocityAcc` 会得到 inf / 异常大的整数。上位机应避免下发「位置不变但速度突变」
-   的设定点，或保证相邻点位置严格递进。
-2. **updateTimeout 需匹配下发频率**：默认 200ms。上位机若下发间隔可能超过它会误触发减速；
-   高频流式下发（如 ≥50Hz，即 20ms 一个点）时 200ms 有足够裕度。
-3. **无内部限速/限位**：轨迹模式不校验 ratedVelocity 与软限位，运动安全性依赖上位机规划的
-   正确性 + 固件超时兜底这道最后防线。
+1. **Δp=0 的奇点（已在固件侧加固）**：若某新点 `_goalPosition == positionNow`，边值反解分母为 0。
+   现在 `CalcSoftGoal` 做了除零保护：`Δp==0` 时不再相除，退化为「朝目标速度以 ±maxAcc 逼近」；
+   `Δp≠0` 时先在 float 域把 `dynamicVelocityAcc` 钳到 `±maxAcc`（= ratedVelocityAcc）再转 int32，
+   从根本上杜绝 inf / INT32 饱和飞车。上位机仍应避免「位置不变但速度突变」这类病态点。
+2. **零速终点到达锁存（已在固件侧加固）**：当某设定点 `_goalVelocity==0`（轨迹收尾或中途暂停），
+   规划态在**位置越过 goalPosition 的当拍**即锁存：`positionNow=goalPosition、velocityNow=0、holdFlag=true`，
+   此后跳过积分、精确保持在 p，直到下一个新点释放（新点分支会置 `holdFlag=false`）。因而在额定加速度
+   可实现的范围内，`(p,0)` 收尾能**精确停在 p**，不再过冲/回退，也不再依赖 200ms 超时。
+   - 若要求的减速 `|v₀²/2Δp| > maxAcc`（比额定加速度还急），钳制后到 p 仍有残余速度，会在 p 处做一次
+     **有界硬停**（力度受 DCE 限流约束）——位置精确、停止偏 firm。
+   - 「已静止却收到远处 `(p,0)`」属病态命令：`approaching=false` 不触发锁存，保持原位（与旧行为一致）。
+3. **updateTimeout 需匹配下发频率**：默认 200ms。上位机若下发间隔可能超过它会误触发减速；
+   高频流式下发（如 ≥50Hz，即 20ms 一个点）时 200ms 有足够裕度。注意锁存/超时判据均以「设定点数值
+   是否变化」为准——**忠实重发完全相同的 (p,v) 不刷新计时**，200ms 后仍会触发超时兜底。
+4. **加速度上限（对原「无内部限速/限位」的修订）**：轨迹模式仍不校验 ratedVelocity 与软限位，位置/速度
+   轮廓由上位机决定；但**段内加速度现已被 `maxAcc=ratedVelocityAcc` 封顶**（除零保护与钳制引入）。对平滑
+   轨迹（段内加速度远小于额定值）无影响，仅对过激/退化命令生效。运动安全的最后防线仍是固件超时兜底。
 
 ---
 

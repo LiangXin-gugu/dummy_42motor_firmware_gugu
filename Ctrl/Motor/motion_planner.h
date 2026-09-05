@@ -170,6 +170,7 @@ public:
         int32_t updateTime = 0;
         int32_t updateTimeout = 200; // (ms) motion set-points cmd max interval
         bool overtimeFlag = false;
+        bool holdFlag = false;    // zero-velocity goal "arrival latch": hold exactly at goalPosition
         int32_t recordVelocity = 0;
         int32_t recordPosition = 0;
         int32_t dynamicVelocityAccRemainder = 0;
